@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Liquid Glass WebGL Demo (Mouse Interactive)</title>
+    <title>Liquid Glass WebGL Demo (Direct Mouse Follow)</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #1a1a1a; display: flex; justify-content: center; align-items: center; min-height: 100vh; cursor: default; }
         canvas { display: block; background-color: #000; border: 1px solid #333; }
@@ -24,7 +24,7 @@
     <canvas id="glCanvas"></canvas>
     <div id="info">
         Liquid Glass WebGL Demo<br>
-        (SDF + Ray Marching + Refraction + Background Image + Mouse Move)
+        (SDF + Ray Marching + Refraction + Background Image + Direct Mouse Follow)
     </div>
 
     <script>
@@ -89,6 +89,16 @@
 
             // --- Scene SDF (defines the glass object) ---
             float map(vec3 p) {
+                // Adjust point 'p' based on mouse position to move the object
+                // Normalize mouse coords to -1 to 1 range
+                vec2 mouseNorm = (iMouse.xy / iResolution.xy) * 2.0 - 1.0;
+                
+                // Scale mouse movement for object displacement
+                // Y-axis needs to be inverted for traditional screen coords (positive up in GLSL, positive down in screen)
+                vec3 mouseOffset = vec3(mouseNorm.x * 0.7, -mouseNorm.y * 0.7, 0.0); // Adjust 0.7 for movement sensitivity
+
+                p -= mouseOffset; // Subtract offset from 'p' to move the object
+
                 vec3 glassSize = vec3(0.6, 0.3, 0.06); // Width, Height, Thickness
                 float cornerRadius = 0.08;
 
@@ -145,10 +155,8 @@
                 vec2 uv = gl_FragCoord.xy / iResolution.xy; // Normalized screen coordinates (0 to 1)
                 vec2 p_ndc = -1.0 + 2.0 * uv; // Normalized Device Coordinates (-1 to 1)
 
-                // Adjust camera origin based on mouse position
-                // Normalize mouse coords to -1 to 1 range and scale for movement
-                vec2 mouseNorm = (iMouse.xy / iResolution.xy) * 2.0 - 1.0;
-                vec3 ro = vec3(mouseNorm.x * 0.5, -mouseNorm.y * 0.5, 2.5); // Invert Y for typical mouse movement
+                // Camera setup (fixed position now, object moves relative to it)
+                vec3 ro = vec3(0.0, 0.0, 2.5); 
 
                 // Adjust ray direction for aspect ratio
                 float aspectRatio = iResolution.x / iResolution.y;
@@ -191,28 +199,26 @@
                     vec3 finalRefractedDir = refractRay(refractedDirIntoGlass, -exitNormal, glassIOR / 1.0);
 
                     // 6. Sample background/environment texture using the final refracted ray direction
-                    // For screen-space refraction, we simulate the effect by offsetting the original UV
-                    // based on the refracted ray direction. This is a simplification.
-                    vec2 refractedUV = uv + finalRefractedDir.xy * 0.2 * (1.0 - abs(p_ndc.x)); // Add more distortion towards center
-                    refractedUV = clamp(refractedUV, 0.0, 1.0); // Clamp to screen bounds
+                    vec2 refractedUV = uv + finalRefractedDir.xy * 0.2 * (1.0 - abs(p_ndc.x));
+                    refractedUV = clamp(refractedUV, 0.0, 1.0);
 
                     // Use the background image texture
                     vec3 refractedColor = texture2D(iChannel0, refractedUV).rgb;
 
                     // Add some basic Fresnel reflection at the entry point
                     float fresnelFactor = pow(1.0 - max(0.0, dot(-rd, glassNormal)), 3.0);
-                    vec3 reflectedColor = texture2D(iChannel0, uv).rgb; // Simple reflection from current UV
+                    vec3 reflectedColor = texture2D(iChannel0, uv).rgb;
 
                     // Mix refracted and reflected colors based on Fresnel factor
                     finalColor.rgb = mix(refractedColor, reflectedColor, fresnelFactor);
 
                     // Add some subtle edge lighting/tint to the glass itself
                     float rimLight = pow(1.0 - max(0.0, dot(glassNormal, -rd)), 5.0);
-                    finalColor.rgb += vec3(0.2, 0.4, 0.6) * rimLight * 0.5; // Blueish tint for edges
+                    finalColor.rgb += vec3(0.2, 0.4, 0.6) * rimLight * 0.5;
 
                     // Apply a slight internal tint to the glass
-                    finalColor.rgb *= 0.95; // Make it slightly darker/tinted
-                    finalColor.a = 1.0; // Ensure alpha is 1.0 for opaque glass effect
+                    finalColor.rgb *= 0.95;
+                    finalColor.a = 1.0;
                 } else {
                     // If no glass is hit, just sample the background directly
                     finalColor.rgb = texture2D(iChannel0, uv).rgb;
@@ -288,13 +294,13 @@
         const resolutionUniformLocation = gl.getUniformLocation(shaderProgram, 'iResolution');
         const timeUniformLocation = gl.getUniformLocation(shaderProgram, 'iTime');
         const backgroundTextureUniformLocation = gl.getUniformLocation(shaderProgram, 'iChannel0');
-        const mouseUniformLocation = gl.getUniformLocation(shaderProgram, 'iMouse'); // Get mouse uniform location
+        const mouseUniformLocation = gl.getUniformLocation(shaderProgram, 'iMouse');
 
         let startTime = Date.now();
 
         // --- Load background image ---
         const backgroundImage = new Image();
-        backgroundImage.src = ''; // Replace with your image URL
+        backgroundImage.src = 'back.jpg'; // Replace with your image URL
         let backgroundTexture;
 
         backgroundImage.onload = () => {
@@ -306,7 +312,7 @@
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-            requestAnimationFrame(render); // Start render loop once image is loaded
+            requestAnimationFrame(render);
         };
 
         if(backgroundImage.complete && backgroundImage.naturalWidth > 0) {
@@ -315,7 +321,7 @@
             backgroundImage.onerror = () => {
                 console.error("Failed to load background image. Please check the URL or use a local image.");
                 document.getElementById('info').textContent = 'Error: Failed to load background image. Using default background.';
-                requestAnimationFrame(render); // Fallback to starting render without image
+                requestAnimationFrame(render);
             };
         }
 
@@ -327,7 +333,6 @@
             gl.uniform2f(resolutionUniformLocation, gl.canvas.width, gl.canvas.height);
             gl.uniform1f(timeUniformLocation, (Date.now() - startTime) * 0.001);
 
-            // Pass mouse coordinates to the shader
             gl.uniform2f(mouseUniformLocation, mouseX, mouseY);
 
             if (backgroundTexture) {
