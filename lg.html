@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liquid Glass WebGL Demo</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        canvas { display: block; background-color: #000; border: 1px solid #333; }
+        #info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: #eee;
+            font-family: sans-serif;
+            font-size: 14px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="glCanvas"></canvas>
+    <div id="info">
+        Liquid Glass WebGL Demo<br>
+        (SDF + Ray Marching + Refraction + Background Image)
+    </div>
+
+    <script>
+        // --- WebGL Setup ---
+        const canvas = document.getElementById('glCanvas');
+        const gl = canvas.getContext('webgl');
+
+        if (!gl) {
+            alert('Your browser does not support WebGL. Please try a different browser.');
+        }
+
+        // Set canvas resolution to fill the window
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas(); // Initial resize
+
+        // Vertex Shader (simple pass-through for full screen quad)
+        const vsSource = `
+            attribute vec4 a_position;
+            void main() {
+                gl_Position = a_position;
+            }
+        `;
+// Fragment Shader (core logic for Liquid Glass)
+            const fsSource = `
+            precision highp float;
+
+            uniform vec2  iResolution;
+            uniform float iTime;
+            uniform sampler2D iChannel0; // Background image
+
+            // --- Utility Functions ---
+
+            // Hash function for random-like values
+            vec2 hash22(vec2 p) {
+                p = fract(p * vec2(5.3983, 5.4427));
+                p += dot(p.yx, p.xy + vec2(21.5351, 14.3137));
+                return fract(vec2(p.x * p.y, p.x + p.y));
+            }
+
+            // 2D Value Noise (for background animation - now unused)
+            float noise(vec2 p) {
+                vec2 ip = floor(p);
+                vec2 u = fract(p);
+                u = u * u * (3.0 - 2.0 * u); // Smooth step
+
+                float res = mix(
+                    mix(hash22(ip).x, hash22(ip + vec2(1.0, 0.0)).x, u.x),
+                    mix(hash22(ip + vec2(0.0, 1.0)).x, hash22(ip + vec2(1.0, 1.0)).x, u.x),
+                    u.y
+                );
+                return res;
+            }
+
+            // Background Pattern (simple animated noise - now unused)
+            vec3 backgroundPattern(vec2 uv, float time) {
+                float n1 = noise(uv * 5.0 + time * 0.1);
+                float n2 = noise(uv * 8.0 - time * 0.05 + vec2(10.0));
+                float n3 = noise(uv * 12.0 + time * 0.2 + vec2(20.0));
+                float color = (n1 + n2 + n3) / 3.0; // Mix noise layers
+                return vec3(0.1 + color * 0.4, 0.3 + color * 0.3, 0.5 + color * 0.2); // Blueish-purple animated background
+            }
+
+            // --- SDF Functions ---
+
+            // Round Box SDF (main glass shape)
+            float sdRoundBox(vec3 p, vec3 b, float r) {
+                vec3 q = abs(p) - b;
+                return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
+            }
+
+            // --- Scene SDF (defines the glass object) ---
+            float map(vec3 p) {
+                vec3 glassSize = vec3(0.6, 0.3, 0.06); // Width, Height, Thickness
+                float cornerRadius = 0.08;
+
+                // Add simple animation to the glass thickness to simulate 'liquid' flow
+                float thicknessDeform = sin(p.x * 5.0 + iTime * 2.0) * 0.02 +
+                                        cos(p.y * 5.0 + iTime * 1.5) * 0.02;
+                glassSize.z += thicknessDeform;
+                glassSize.z = max(0.01, glassSize.z); // Ensure thickness is not too small
+
+                return sdRoundBox(p, glassSize, cornerRadius);
+            }
+
+            // --- Ray Marching ---
+            // Define constants for ray marching parameters directly in GLSL
+            const float MAX_RAY_DIST = 10.0;
+            const float HIT_EPSILON = 0.001;
+            const int MAX_STEPS = 80;
+
+            vec3 rayMarch(vec3 ro, vec3 rd) { // Parameters removed from signature
+                float dist = 0.0;
+                for (int i = 0; i < MAX_STEPS; i++) { // Loop condition uses constant
+                    vec3 p = ro + rd * dist;
+                    float d = map(p);
+                    if (d < HIT_EPSILON) { // Comparison uses constant
+                        return p; // Return intersection point
+                    }
+                    dist += d;
+                    if (dist > MAX_RAY_DIST) { // Comparison uses constant
+                        break;
+                    }
+                }
+                return ro + rd * MAX_RAY_DIST; // No hit, return point at max distance
+            }
+
+            // Calculate surface normal using finite differences
+            vec3 calculateNormal(vec3 p) {
+                vec2 eps = vec2(0.001, 0.0);
+                return normalize(vec3(
+                    map(p + eps.xyy) - map(p - eps.xyy),
+                    map(p + eps.yxy) - map(p - eps.yxy),
+                    map(p + eps.yyx) - map(p - eps.yyx)
+                ));
+            }
+
+            // --- Refraction Function (Snell's Law) ---
+            vec3 refractRay(vec3 I, vec3 N, float eta) {
+                float N_dot_I = dot(N, I);
+                float k = 1.0 - eta * eta * (1.0 - N_dot_I * N_dot_I);
+                if (k < 0.0) return vec3(0.0); // Total internal reflection or invalid
+                return eta * I - (eta * N_dot_I + sqrt(k)) * N;
+            }
+
+            void main() {
+                vec2 uv = gl_FragCoord.xy / iResolution.xy; // Normalized screen coordinates (0 to 1)
+                vec2 p_ndc = -1.0 + 2.0 * uv; // Normalized Device Coordinates (-1 to 1)
+
+                // Camera setup
+                vec3 ro = vec3(0.0, 0.0, 2.5); // Ray Origin (camera position, slightly back)
+                // Adjust ray direction for aspect ratio
+                float aspectRatio = iResolution.x / iResolution.y;
+                vec3 rd = normalize(vec3(p_ndc.x * aspectRatio, p_ndc.y, -1.5)); // Ray Direction towards scene
+
+                float glassIOR = 1.5; // Index of Refraction for typical glass
+
+                // 1. Ray march to find the first intersection with the glass surface
+                vec3 glassIntersectionPoint = rayMarch(ro, rd); // Parameters removed
+                float distToGlass = length(glassIntersectionPoint - ro);
+
+                vec4 finalColor = vec4(0.0); // Initialize with alpha 0.0
+
+                // If we hit the glass (check if distance is less than maxDist)
+                // We add a small buffer to MAX_RAY_DIST to ensure a clear hit.
+                if (distToGlass < MAX_RAY_DIST - HIT_EPSILON * 2.0) {
+                    vec3 glassNormal = calculateNormal(glassIntersectionPoint);
+
+                    // Ensure normal points outwards from the surface for refraction
+                    // If the dot product is positive, the normal points away from the ray direction (outwards).
+                    // If negative, it points towards the ray direction (inwards), so we flip it.
+                    if (dot(rd, glassNormal) > 0.0) {
+                        glassNormal = -glassNormal;
+                    }
+
+                    // 2. Refract the ray *into* the glass (Air to Glass)
+                    // eta = n_air / n_glass = 1.0 / glassIOR
+                    vec3 refractedDirIntoGlass = refractRay(rd, glassNormal, 1.0 / glassIOR);
+
+                    // To avoid self-intersection issues, start the internal ray march slightly inside the object
+                    vec3 startInsidePoint = glassIntersectionPoint + refractedDirIntoGlass * HIT_EPSILON * 2.0;
+
+                    // 3. Ray march *inside* the glass to find the exit point
+                    vec3 exitPoint = rayMarch(startInsidePoint, refractedDirIntoGlass); // Parameters removed
+
+                    // 4. Calculate normal at exit point
+                    vec3 exitNormal = calculateNormal(exitPoint);
+                    // Ensure exit normal points outwards from glass
+                    // If the dot product is positive, the normal points away from the internal ray direction (outwards).
+                    // If negative, it points towards the internal ray direction (inwards), so we flip it.
+                    if (dot(refractedDirIntoGlass, exitNormal) > 0.0) {
+                        exitNormal = -exitNormal;
+                    }
+
+                    // 5. Refract the ray *out of* the glass (Glass to Air)
+                    // eta = n_glass / n_air = glassIOR / 1.0
+                    vec3 finalRefractedDir = refractRay(refractedDirIntoGlass, -exitNormal, glassIOR / 1.0);
+
+                    // 6. Sample background/environment texture using the final refracted ray direction
+                    // For screen-space refraction, we simulate the effect by offsetting the original UV
+                    // based on the refracted ray direction. This is a simplification.
+                    vec2 refractedUV = uv + finalRefractedDir.xy * 0.2 * (1.0 - abs(p_ndc.x)); // Add more distortion towards center
+                    refractedUV = clamp(refractedUV, 0.0, 1.0); // Clamp to screen bounds
+
+                    // Use the background image texture
+                    vec3 refractedColor = texture2D(iChannel0, refractedUV).rgb;
+
+                    // Add some basic Fresnel reflection at the entry point
+                    // As the angle of incidence increases, more light is reflected, less is refracted.
+                    float fresnelFactor = pow(1.0 - max(0.0, dot(-rd, glassNormal)), 3.0);
+                    vec3 reflectedColor = texture2D(iChannel0, uv).rgb; // Simple reflection from current UV
+
+                    // Mix refracted and reflected colors based on Fresnel factor
+                    finalColor.rgb = mix(refractedColor, reflectedColor, fresnelFactor);
+
+                    // Add some subtle edge lighting/tint to the glass itself
+                    float rimLight = pow(1.0 - max(0.0, dot(glassNormal, -rd)), 5.0);
+                    finalColor.rgb += vec3(0.2, 0.4, 0.6) * rimLight * 0.5; // Blueish tint for edges
+
+                    // Apply a slight internal tint to the glass
+                    finalColor.rgb *= 0.95; // Make it slightly darker/tinted
+                    finalColor.a = 1.0; // Ensure alpha is 1.0 for opaque glass effect
+                } else {
+                    // If no glass is hit, just sample the background directly
+                    finalColor.rgb = texture2D(iChannel0, uv).rgb;
+                    finalColor.a = 1.0;
+                }
+
+                gl_FragColor = finalColor; // Corrected: directly assign finalColor (which is vec4)
+            }
+        `;
+
+        // --- WebGL Helper Functions ---
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                // Log compilation error
+                console.error('Error compiling shader:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vsSource, fsSource) {
+            const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+            // Only proceed if both shaders compiled successfully
+            if (!vertexShader || !fragmentShader) {
+                return null;
+            }
+
+            const program = gl.createProgram();
+            gl.attachShader(program, vertexShader);
+            gl.attachShader(program, fragmentShader);
+            gl.linkProgram(program);
+
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                // Log linking error
+                console.error('Error linking program:', gl.getProgramInfoLog(program));
+                gl.deleteProgram(program);
+                return null;
+            }
+            return program;
+        }
+
+        const shaderProgram = createProgram(gl, vsSource, fsSource);
+
+        // Check if program creation was successful before proceeding
+        if (!shaderProgram) {
+            console.error("Failed to create WebGL program. Check console for shader compilation/linking errors.");
+            // Stop execution or display an error message to the user
+            document.getElementById('info').textContent = 'Error: WebGL initialization failed. Check browser console.';
+            throw new Error("WebGL program creation failed.");
+        }
+
+        gl.useProgram(shaderProgram);
+
+        // --- Set up full-screen quad ---
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        const positions = [
+            -1.0, -1.0, // bottom-left
+             1.0, -1.0, // bottom-right
+            -1.0,  1.0, // top-left
+            -1.0,  1.0, // top-left
+             1.0, -1.0, // bottom-right
+             1.0,  1.0, // top-right
+        ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+        const positionAttributeLocation = gl.getAttribLocation(shaderProgram, 'a_position');
+        gl.enableVertexAttribArray(positionAttributeLocation);
+        gl.vertexAttribPointer(positionAttributeLocation, 2, gl.FLOAT, false, 0, 0);
+
+        // --- Get Uniform Locations ---
+        const resolutionUniformLocation = gl.getUniformLocation(shaderProgram, 'iResolution');
+        const timeUniformLocation = gl.getUniformLocation(shaderProgram, 'iTime');
+        const backgroundTextureUniformLocation = gl.getUniformLocation(shaderProgram, 'iChannel0');
+
+        let startTime = Date.now();
+
+        // --- Load background image ---
+        const backgroundImage = new Image();
+        // Use the generated image URL.  Replace with your desired image.
+        backgroundImage.src = 'back.jpg'; // A more reliable example image URL
+        // If you want to use the previous generated one:
+        // backgroundImage.src = 'http://googleusercontent.com/image_generation_content/0';
+
+        let backgroundTexture;
+
+        backgroundImage.onload = () => {
+            backgroundTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, backgroundTexture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, backgroundImage);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+            // Start the render loop only after the image has loaded
+            requestAnimationFrame(render);
+        };
+
+        // Handle cases where the image might be cached and load instantly
+        if(backgroundImage.complete && backgroundImage.naturalWidth > 0) {
+            // Call onload directly if image is already cached
+            backgroundImage.onload();
+        } else {
+             // Optional: handle image loading errors
+            backgroundImage.onerror = () => {
+                console.error("Failed to load background image. Please check the URL.");
+                document.getElementById('info').textContent = 'Error: Failed to load background image. Using default background.';
+                // Fallback to starting render without image if preferred
+                requestAnimationFrame(render);
+            };
+        }
+
+
+        // --- Render Loop ---
+        function render() {
+            gl.clearColor(0.0, 0.0, 0.0, 1.0); // Clear background to black
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            gl.uniform2f(resolutionUniformLocation, gl.canvas.width, gl.canvas.height);
+            gl.uniform1f(timeUniformLocation, (Date.now() - startTime) * 0.001); // Time in seconds
+
+            if (backgroundTexture) {
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, backgroundTexture);
+                gl.uniform1i(backgroundTextureUniformLocation, 0); // Tell the shader to use texture unit 0
+            }
+
+            gl.drawArrays(gl.TRIANGLES, 0, 6); // Draw the full-screen quad
+
+            // requestAnimationFrame(render); // Moved into image.onload to prevent drawing before image loads
+        }
+
+    </script>
+</body>
+</html>
